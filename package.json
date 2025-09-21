@@ -1,0 +1,78 @@
+{
+  "name": "nuxt-app",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local Qwen chat app (Nuxt + Electron + node-llama-cpp)",
+  "author": "Your Name",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "concurrently -k \"cross-env NUXT_ELECTRON=1 nuxt dev --port 5173\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "electron": "electron .",
+    "dist": "nuxt build && electron-builder"
+  },
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "node-llama-cpp": "^3.13.0",
+    "nuxt": "^4.1.2",
+    "vue": "^3.5.21",
+    "vue-router": "^4.5.1"
+  },
+  "devDependencies": {
+    "@types/lodash": "^4.17.20",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.0.0",
+    "electron": "^38.1.2",
+    "electron-builder": "^26.0.12",
+    "vite-plugin-electron": "^0.29.0",
+    "wait-on": "^9.0.0"
+  },
+  "build": {
+    "appId": "com.example.qwen-chat",
+    "productName": "Qwen Chat",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      ".output/**",
+      "electron/**",
+      "package.json",
+      "node_modules/**"
+    ],
+    "extraResources": [
+      {
+        "from": "models",
+        "to": "models",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asarUnpack": [
+      "models/**",
+      "**/*.node"
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.productivity"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility"
+    }
+  }
+}
