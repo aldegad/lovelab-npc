@@ -50,21 +50,62 @@ async function initModel() {
       ? path.join(process.resourcesPath, 'models')
       : path.join(__dirname, '..', 'models');
 
-    // 모델 경로 결정 (샤드/단일 모두 커버)
-    let modelPath = '';
-    try {
-      const files = fs.readdirSync(modelsDir);
-      const shard = files.find(f => /-00001-of-\d+\.gguf$/.test(f));
-      modelPath = path.join(modelsDir, shard ?? files.find(f => f.endsWith('.gguf')) ?? '');
-    } catch {}
+    // Find a GGUF model file under models directory (recursively)
+    function findFirstGguf(searchDir) {
+      const entries = fs.readdirSync(searchDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const p = path.join(searchDir, entry.name);
+        if (entry.isFile() && entry.name.toLowerCase().endsWith('.gguf')) return p;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const found = findFirstGguf(path.join(searchDir, entry.name));
+          if (found) return found;
+        }
+      }
+      return null;
+    }
 
-    console.log('[electron] loading model:', modelPath);
-    const model = await llama.loadModel({ modelPath });
+    const qwen14bDir = path.join(modelsDir, 'qwen3-14b');
+    const ggufPath = findFirstGguf(qwen14bDir);
+
+    if (!ggufPath) {
+      // Give a helpful error if only safetensors are present
+      const hasSafetensors = (() => {
+        let found = false;
+        const stack = [modelsDir];
+        while (stack.length) {
+          const dir = stack.pop();
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            const p = path.join(dir, entry.name);
+            if (entry.isFile() && entry.name.toLowerCase().endsWith('.safetensors')) {
+              found = true;
+              break;
+            }
+            if (entry.isDirectory()) stack.push(p);
+          }
+          if (found) break;
+        }
+        return found;
+      })();
+
+      console.error('[electron] No GGUF model found under', modelsDir);
+      if (hasSafetensors) {
+        console.error('[electron] Detected .safetensors files. node-llama-cpp only supports GGUF (llama.cpp) models.');
+        console.error('[electron] Please place a Qwen GGUF file (e.g. qwen2.5-7b-instruct-q4_k_m.gguf) under the models folder.');
+      }
+      return;
+    }
+
+    console.log('[electron] Loading GGUF model:', ggufPath);
+
+    const model = await llama.loadModel({ modelPath: ggufPath });
     const context = await model.createContext();
-    ctx = context; // 나중엔 maxTokens 등에 씀
+    ctx = context;
     session = new LlamaChatSession({ contextSequence: context.getSequence() });
 
-    // (A) 내 JSON 스키마로 grammar 생성 (권장)
+    // (A) Create a grammar for your JSON schema (recommended)
     jsonGrammar = await llama.createGrammarForJsonSchema({
       type: 'object',
       properties: {
@@ -76,7 +117,7 @@ async function initModel() {
       additionalProperties: false
     });
 
-    // (B) 혹은 내장 JSON grammar (형식만 JSON, 키 고정은 아님)
+    // (B) Or use the built-in JSON grammar (enforces JSON format, but not specific keys)
     // jsonGrammar = await llama.getGrammarFor('json');
 
     console.log('LLM session + grammar ready');
@@ -102,18 +143,54 @@ app.on('window-all-closed', () => {
   }
 })
 
-ipcMain.handle('llm:prompt', async (_e, { prompt }) => {
+function chatmlFromTurns(system, turns = []) {
+  const parts = []
+  parts.push(`<|im_start|>system`)
+  parts.push((system ?? '').trim())
+  parts.push(`<|im_end|>`)
+  for (const t of turns) {
+    const role = t && t.role === 'assistant' ? 'assistant' : 'user'
+    const text = (t && t.text ? String(t.text) : '').trim()
+    parts.push(`<|im_start|>${role}`)
+    parts.push(text)
+    parts.push(`<|im_end|>`)
+  }
+  // 다음 assistant 메시지(JSON)를 생성하도록 시작만 열어둔다
+  parts.push(`<|im_start|>assistant\n`)
+  return parts.join('\n')
+}
+
+ipcMain.handle('llm:prompt', async (_e, payload) => {
   if (!session) throw new Error('Model not ready');
 
-  // 프롬프트엔 "무엇을 써야 하는지" 의미만 남기고,
-  // 형식 강제는 grammar가 담당
+  // {system, turns} 전용
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Invalid payload: expected { system, turns }')
+  }
+  const { system, turns } = payload
+  if (typeof system !== 'string') {
+    throw new Error('Invalid payload: "system" must be a string')
+  }
+  if (!Array.isArray(turns)) {
+    throw new Error('Invalid payload: "turns" must be an array')
+  }
+
+  const prompt = chatmlFromTurns(system, turns)
+
+  console.log('[electron] prompt:', prompt);
   const reply = await session.prompt(prompt, {
     grammar: jsonGrammar,
-    // 일부 grammar에서 멈춤 이슈가 있어 context 크기 정도로 제한 권장
-    maxTokens: ctx?.contextSize ?? 2048
+    maxTokens: 1024,
+    // Qwen 권장에 맞춰 샘플링 조정 (비-thinking 모드 기준)
+    temperature: 0.7,
+    topP: 0.8,
+    topK: 20,
+    presencePenalty: 1.5,
+    repeatPenalty: 1.05, // 기존 값 유지 (원하면 1.1~1.15로 미세조정 가능)
+    // 문법 비활성 시를 대비한 예비 stop 토큰 (grammar 사용 중에는 무시됨)
+    stop: ["<|im_end|>", "<|endoftext|>"],
   });
   console.log('[electron] reply:', reply);
-  const result = jsonGrammar.parse(reply); // 안전한 JS 객체
-  return result; // 항상 유효 JSON
+  const result = jsonGrammar.parse(reply); // Safely parse into a JS object
+  return result; // Always a valid JSON
 });
-
